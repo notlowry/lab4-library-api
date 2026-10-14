@@ -1,7 +1,22 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Library API")
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
+
+import models
+from database import Base, SessionLocal, engine
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(title="Library API", lifespan=lifespan)
 
 
 class BookIn(BaseModel):
@@ -10,51 +25,70 @@ class BookIn(BaseModel):
     year: int = Field(..., ge=0, le=2100)
 
 
-class Book(BookIn):
+class BookOut(BookIn):
     id: int
+    model_config = ConfigDict(from_attributes=True)
 
 
-books: list[Book] = []
-next_id = 1
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-def find_book(book_id: int) -> Book:
-    for book in books:
-        if book.id == book_id:
-            return book
-    raise HTTPException(status_code=404, detail="Book not found")
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(
+    request: Request, exc: RequestValidationError
+):
+    return JSONResponse(status_code=400, content={"detail": "Invalid input data"})
 
 
-@app.get("/books")
-def get_books():
-    return books
+@app.get("/books", response_model=list[BookOut])
+def get_books(db: Session = Depends(get_db)):
+    return db.query(models.Book).order_by(models.Book.id).all()
 
 
-@app.get("/books/{book_id}")
-def get_book(book_id: int):
-    return find_book(book_id)
-
-
-@app.post("/books", status_code=201)
-def add_book(data: BookIn):
-    global next_id
-    book = Book(id=next_id, **data.model_dump())
-    next_id += 1
-    books.append(book)
+@app.get("/books/{book_id}", response_model=BookOut)
+def get_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.get(models.Book, book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
     return book
 
 
-@app.put("/books/{book_id}")
-def update_book(book_id: int, data: BookIn):
-    book = find_book(book_id)
-    book.title = data.title
-    book.author = data.author
-    book.year = data.year
+@app.post("/books", response_model=BookOut, status_code=201)
+def add_book(data: BookIn, db: Session = Depends(get_db)):
+    book = models.Book(**data.model_dump())
+    db.add(book)
+    db.commit()
+    db.refresh(book)
+    return book
+
+
+@app.put("/books/{book_id}", response_model=BookOut)
+def update_book(
+    book_id: int, data: BookIn, db: Session = Depends(get_db)
+):
+    book = db.get(models.Book, book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    for key, value in data.model_dump().items():
+        setattr(book, key, value)
+
+    db.commit()
+    db.refresh(book)
     return book
 
 
 @app.delete("/books/{book_id}")
-def delete_book(book_id: int):
-    book = find_book(book_id)
-    books.remove(book)
+def delete_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.get(models.Book, book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    db.delete(book)
+    db.commit()
     return {"detail": "Book deleted"}
